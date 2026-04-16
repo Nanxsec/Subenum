@@ -99,7 +99,7 @@ def print_banner():
   ╚════██║██║   ██║██╔══██╗██╔══╝  ██║╚██╗██║██║   ██║██║╚██╔╝██║
   ███████║╚██████╔╝██████╔╝███████╗██║ ╚████║╚██████╔╝██║ ╚═╝ ██║
   ╚══════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝
-{C.RESET}{C.GRAY}  Subdomain & Directory Enumerator v3.0  —  zero deps, pure Python{C.RESET}
+{C.RESET}{C.GRAY}  Subdomain & Directory Enumerator v3.0{C.RESET}
 """)
 
 
