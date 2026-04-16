@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-subenum — Subdomain + Directory + VHost Enumerator
-Zero external dependencies. Python 3.8+
-"""
 
 import asyncio
 import argparse
