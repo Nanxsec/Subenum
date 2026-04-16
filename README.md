@@ -1,3 +1,6 @@
+<img width="1672" height="941" alt="subenum" src="https://github.com/user-attachments/assets/d50a0869-8cd6-4bdd-9b17-f808cff68020" />
+
+
 # subenum
 
 Enumerador de subdomínios, diretórios e virtual hosts escrito em Python puro. Sem dependências externas. Compatível com Python 3.8+.
