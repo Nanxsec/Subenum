@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""
+subenum — Subdomain + Directory + VHost Enumerator
+Zero external dependencies. Python 3.8+
+"""
 
 import asyncio
 import argparse
@@ -6,6 +10,7 @@ import hashlib
 import http.client
 import random
 import re
+import os
 import socket
 import ssl
 import string
@@ -15,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Set, Tuple
 
-
+os.system("clear")
 # ─────────────────────────────────────────────
 #  ANSI Colors
 # ─────────────────────────────────────────────
@@ -99,7 +104,7 @@ def print_banner():
   ╚════██║██║   ██║██╔══██╗██╔══╝  ██║╚██╗██║██║   ██║██║╚██╔╝██║
   ███████║╚██████╔╝██████╔╝███████╗██║ ╚████║╚██████╔╝██║ ╚═╝ ██║
   ╚══════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝     ╚═╝
-{C.RESET}{C.GRAY}  Subdomain & Directory Enumerator v3.0{C.RESET}
+{C.RESET}{C.GRAY}  Subdomain & Directory Enumerator v3.0  —  zero deps, pure Python{C.RESET}
 """)
 
 
@@ -305,27 +310,25 @@ def _raw_request(
     timeout: float,
     host_header: Optional[str] = None,
 ) -> Tuple[Optional[int], Optional[bytes], Optional[str]]:
-    """
-    Single HTTP GET — no redirects.
-    Returns (status, body, location_header).
-    host_header overrides the Host: value (used for vhost probing).
-    """
     h = host_header or host
     try:
         if use_ssl:
             conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=_make_ssl_ctx())
         else:
             conn = http.client.HTTPConnection(host, port, timeout=timeout)
+
         conn.request("GET", path, headers={
             "User-Agent": "subenum/3.0",
             "Host": h,
             "Accept": "*/*",
-            "Connection": "close",
+            "Connection": "keep-alive",  # 🔥 mudou aqui
         })
+
         resp   = conn.getresponse()
         status = resp.status
         loc    = resp.getheader("Location", None)
-        body   = resp.read(500_000)
+        body   = resp.read(50000)  # 🔥 reduzi de 500k → 50k
+
         conn.close()
         return status, body, loc
     except Exception:
@@ -497,24 +500,278 @@ def _probe_dir(
     if status is None or status in filter_codes:
         return None
 
-    bsize, bwords, blines = body_stats(body)
-    bh = md5(body) if body else None
+    if not body:
+        return None
 
-    # Same as homepage
+    bsize = len(body)
+    bh = md5(body)
+
     if home_hash and bh == home_hash:
         return None
-
-    # Identical to catch-all baseline
     if baseline_hash and bh == baseline_hash:
         return None
-
-    # Same status + nearly identical size as baseline (soft-404)
     if baseline_status is not None and status == baseline_status and baseline_size is not None:
         ratio = abs(bsize - baseline_size) / (baseline_size + 1)
         if ratio < 0.05:
             return None
+    if baseline_redirect and loc and baseline_redirect == loc:
+        return None
 
-    # Catch-all redirect
+    title = extract_title(body) if 200 <= status < 300 else None
+    return DirResult(path=path, status=status, size=bsize, title=title, redirect=loc)
+
+
+# ─────────────────────────────────────────────
+#  Async native HTTP for dir mode  ← TURBO ENGINE
+# ─────────────────────────────────────────────
+async def _async_http_request(
+    host: str, port: int, use_ssl: bool, path: str, timeout: float
+) -> Tuple[Optional[int], Optional[bytes], Optional[str]]:
+    """
+    Fully async HTTP/1.1 GET using asyncio.open_connection.
+    No threads, no blocking — genuine concurrency.
+    """
+    try:
+        if use_ssl:
+            ssl_ctx = _make_ssl_ctx()
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port, ssl=ssl_ctx), timeout=timeout
+            )
+        else:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=timeout
+            )
+
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            f"User-Agent: subenum/3.0\r\n"
+            f"Accept: */*\r\n"
+            f"Connection: close\r\n\r\n"
+        )
+        writer.write(request.encode())
+        await writer.drain()
+
+        raw = await asyncio.wait_for(reader.read(65536), timeout=timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        return _parse_http_response(raw)
+
+    except Exception:
+        return None, None, None
+
+
+def _parse_http_response(raw: bytes) -> Tuple[Optional[int], Optional[bytes], Optional[str]]:
+    """Parse a raw HTTP/1.1 response. Returns (status, body, location)."""
+    if not raw:
+        return None, None, None
+
+    sep = raw.find(b"\r\n\r\n")
+    if sep == -1:
+        return None, None, None
+
+    header_bytes = raw[:sep]
+    body         = raw[sep + 4:]
+
+    first_line = header_bytes.split(b"\r\n", 1)[0]
+    parts      = first_line.split(b" ", 2)
+    if len(parts) < 2:
+        return None, None, None
+    try:
+        status = int(parts[1])
+    except ValueError:
+        return None, None, None
+
+    loc = None
+    content_length = None
+    connection_close = False
+    for line in header_bytes.split(b"\r\n")[1:]:
+        ll = line.lower()
+        if ll.startswith(b"location:"):
+            loc = line[9:].strip().decode("utf-8", errors="replace")
+        elif ll.startswith(b"content-length:"):
+            try:
+                content_length = int(line[15:].strip())
+            except ValueError:
+                pass
+        elif ll.startswith(b"connection:") and b"close" in ll:
+            connection_close = True
+
+    return status, body, loc, content_length, connection_close
+
+
+class AsyncConnection:
+    """
+    Persistent async HTTP/1.1 connection with keep-alive.
+    Automatically reconnects on failure or server close.
+    One instance per dir_worker — no sharing, no locks needed.
+    """
+    MAX_REQS = 200  # reconnect after this many requests (avoids server-side idle close)
+
+    def __init__(self, host: str, port: int, use_ssl: bool, timeout: float):
+        self.host    = host
+        self.port    = port
+        self.use_ssl = use_ssl
+        self.timeout = timeout
+        self._reader = None
+        self._writer = None
+        self._req_count = 0
+
+    async def _connect(self):
+        self._reader = self._writer = None
+        try:
+            if self.use_ssl:
+                ssl_ctx = _make_ssl_ctx()
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port, ssl=ssl_ctx),
+                    timeout=self.timeout,
+                )
+            else:
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port),
+                    timeout=self.timeout,
+                )
+            self._req_count = 0
+        except Exception:
+            self._reader = self._writer = None
+
+    def _is_alive(self) -> bool:
+        if self._writer is None or self._writer.is_closing():
+            return False
+        if self._req_count >= self.MAX_REQS:
+            return False
+        return True
+
+    async def _close(self):
+        if self._writer:
+            try:
+                self._writer.close()
+                await self._writer.wait_closed()
+            except Exception:
+                pass
+            self._reader = self._writer = None
+
+    async def get(self, path: str) -> Tuple[Optional[int], Optional[bytes], Optional[str]]:
+        for attempt in range(3):
+            if not self._is_alive():
+                await self._close()
+                await self._connect()
+                if not self._is_alive():
+                    return None, None, None
+
+            try:
+                request = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {self.host}:{self.port}\r\n"
+                    f"User-Agent: subenum/3.0\r\n"
+                    f"Accept: */*\r\n"
+                    f"Connection: keep-alive\r\n\r\n"
+                )
+                self._writer.write(request.encode())
+                await asyncio.wait_for(self._writer.drain(), timeout=self.timeout)
+
+                # Read response with Content-Length awareness
+                raw = await asyncio.wait_for(
+                    self._reader.read(131072), timeout=self.timeout
+                )
+                self._req_count += 1
+
+                parsed = _parse_http_response(raw)
+                if parsed[0] is None:
+                    # Bad response — reconnect next round
+                    await self._close()
+                    continue
+
+                status, body, loc, content_length, conn_close = parsed
+
+                # If server signals close, mark for reconnect
+                if conn_close:
+                    await self._close()
+
+                return status, body, loc
+
+            except Exception:
+                await self._close()
+                continue
+
+        return None, None, None
+
+    async def get_vhost(self, path: str, host_header: str) -> Tuple[Optional[int], Optional[bytes], Optional[str]]:
+        """Same as get() but sends a custom Host header (for vhost enumeration)."""
+        for attempt in range(3):
+            if not self._is_alive():
+                await self._close()
+                await self._connect()
+                if not self._is_alive():
+                    return None, None, None
+
+            try:
+                request = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host_header}\r\n"
+                    f"User-Agent: subenum/3.0\r\n"
+                    f"Accept: */*\r\n"
+                    f"Connection: keep-alive\r\n\r\n"
+                )
+                self._writer.write(request.encode())
+                await asyncio.wait_for(self._writer.drain(), timeout=self.timeout)
+
+                raw = await asyncio.wait_for(
+                    self._reader.read(131072), timeout=self.timeout
+                )
+                self._req_count += 1
+
+                parsed = _parse_http_response(raw)
+                if parsed[0] is None:
+                    await self._close()
+                    continue
+
+                status, body, loc, content_length, conn_close = parsed
+                if conn_close:
+                    await self._close()
+
+                return status, body, loc
+
+            except Exception:
+                await self._close()
+                continue
+
+        return None, None, None
+
+    async def close(self):
+        await self._close()
+
+
+async def _async_probe_dir(
+    conn: "AsyncConnection", path: str,
+    baseline_status, baseline_hash, baseline_size, baseline_redirect,
+    home_hash, filter_codes: set,
+) -> Optional[DirResult]:
+    """Async version of _probe_dir — reuses persistent AsyncConnection."""
+    status, body, loc = await conn.get(path)
+    if status is None or status in filter_codes:
+        return None
+    if not body:
+        # allow empty-body redirects through
+        if status not in (301, 302, 303, 307, 308):
+            return None
+        body = b""
+
+    bsize = len(body)
+    bh    = md5(body) if body else ""
+
+    if home_hash and bh == home_hash:
+        return None
+    if baseline_hash and bh == baseline_hash:
+        return None
+    if baseline_status is not None and status == baseline_status and baseline_size is not None:
+        ratio = abs(bsize - baseline_size) / (baseline_size + 1)
+        if ratio < 0.05:
+            return None
     if baseline_redirect and loc and baseline_redirect == loc:
         return None
 
@@ -624,24 +881,23 @@ class VhostBaseline:
         return False
 
 
-def _collect_vhost_baseline(
+async def _collect_vhost_baseline_async(
     ip: str, port: int, use_ssl: bool, domain: str, timeout: float, n: int = 3
 ) -> VhostBaseline:
-    bl = VhostBaseline()
+    bl   = VhostBaseline()
+    conn = AsyncConnection(ip, port, use_ssl, timeout)
     for _ in range(n):
         rand = "".join(random.choices(string.ascii_lowercase, k=14))
         fake = f"{rand}.{domain}"
-        s, body, loc = _raw_request(ip, port, use_ssl, "/", timeout, host_header=fake)
+        s, body, loc = await conn.get_vhost("/", fake)
         bl.add(s, body, loc)
+    await conn.close()
     return bl
 
 
-def _probe_vhost(
-    ip: str,
-    port: int,
-    use_ssl: bool,
+async def _async_probe_vhost(
+    conn: AsyncConnection,
     host_header: str,
-    timeout: float,
     baseline: VhostBaseline,
     filter_codes: Set[int],
     match_codes: Set[int],
@@ -650,7 +906,7 @@ def _probe_vhost(
     filter_lines: Optional[Set[int]],
     match_sizes: Optional[Set[int]],
 ) -> Optional[VhostResult]:
-    status, body, redirect = _raw_request(ip, port, use_ssl, "/", timeout, host_header=host_header)
+    status, body, redirect = await conn.get_vhost("/", host_header)
     if status is None:
         return None
 
@@ -720,26 +976,33 @@ async def sub_worker(queue, domain, loop, wildcard_ips, wildcard_hash,
 async def dir_worker(queue, host, port, use_ssl, base_path,
                      baseline_status, baseline_hash, baseline_size, baseline_redirect,
                      home_hash, results, progress, timeout, filter_codes, semaphore, loop):
-    while True:
-        path = await queue.get()
-        if path is None:
-            queue.task_done()
-            break
-        async with semaphore:
-            result = await loop.run_in_executor(
-                None, _probe_dir,
-                host, port, use_ssl, path, timeout,
-                baseline_status, baseline_hash, baseline_size, baseline_redirect,
-                home_hash, filter_codes,
-            )
-            if result:
-                results.append(result)
-                await progress.hit()
-                progress.clear()
-                print_dir_result(result)
+    # Each worker owns one persistent connection — keep-alive, no TCP overhead per request
+    conn = AsyncConnection(host, port, use_ssl, timeout)
+    try:
+        while True:
+            word = await queue.get()
+            if word is None:
+                queue.task_done()
+                break
+            async with semaphore:
+                full_path = f"{base_path.rstrip('/')}{word}" if base_path else word
 
-        await progress.tick()
-        queue.task_done()
+                result = await _async_probe_dir(
+                    conn, full_path,
+                    baseline_status, baseline_hash, baseline_size, baseline_redirect,
+                    home_hash, filter_codes,
+                )
+
+                if result:
+                    results.append(result)
+                    await progress.hit()
+                    progress.clear()
+                    print_dir_result(result)
+
+            await progress.tick()
+            queue.task_done()
+    finally:
+        await conn.close()
 
 
 async def vhost_worker(
@@ -748,27 +1011,31 @@ async def vhost_worker(
     filter_sizes, filter_words, filter_lines, match_sizes,
     results, progress, timeout, semaphore, loop, domain,
 ):
-    while True:
-        word = await queue.get()
-        if word is None:
-            queue.task_done()
-            break
-        async with semaphore:
-            host_header = f"{word}.{domain}"
-            result = await loop.run_in_executor(
-                None, _probe_vhost,
-                ip, port, use_ssl, host_header, timeout,
-                baseline, filter_codes, match_codes,
-                filter_sizes, filter_words, filter_lines, match_sizes,
-            )
-            if result:
-                results.append(result)
-                await progress.hit()
-                progress.clear()
-                print_vhost_result(result)
+    # One persistent connection per worker — same trick as dir mode
+    conn = AsyncConnection(ip, port, use_ssl, timeout)
+    try:
+        while True:
+            word = await queue.get()
+            if word is None:
+                queue.task_done()
+                break
+            async with semaphore:
+                host_header = f"{word}.{domain}"
+                result = await _async_probe_vhost(
+                    conn, host_header, baseline,
+                    filter_codes, match_codes,
+                    filter_sizes, filter_words, filter_lines, match_sizes,
+                )
+                if result:
+                    results.append(result)
+                    await progress.hit()
+                    progress.clear()
+                    print_vhost_result(result)
 
-        await progress.tick()
-        queue.task_done()
+            await progress.tick()
+            queue.task_done()
+    finally:
+        await conn.close()
 
 
 # ─────────────────────────────────────────────
@@ -859,13 +1126,22 @@ async def run_dir(args):
     semaphore    = asyncio.Semaphore(args.threads)
 
     print(f"  {C.GRAY}[*] Probing baseline (soft-404 detection)...{C.RESET}", end="", flush=True)
-    baseline_status, baseline_hash, baseline_size, baseline_redirect = await loop.run_in_executor(
-        None, _get_baseline_dir, host, port, use_ssl, base_path, args.timeout
-    )
-    _, home_body, _ = await loop.run_in_executor(
-        None, _raw_request, host, port, use_ssl, base_path or "/", args.timeout, None
-    )
+    _bl_conn = AsyncConnection(host, port, use_ssl, args.timeout)
+    rand = "".join(random.choices(string.ascii_lowercase, k=16))
+    _bs_path = f"{base_path.rstrip('/')}/{rand}"
+    _bs_status, _bs_body, _bs_loc = await _bl_conn.get(_bs_path)
+    if _bs_body is not None:
+        _bs_size, _, _ = body_stats(_bs_body)
+        baseline_status   = _bs_status
+        baseline_hash     = md5(_bs_body)
+        baseline_size     = _bs_size
+        baseline_redirect = _bs_loc
+    else:
+        baseline_status = baseline_hash = baseline_size = baseline_redirect = None
+
+    _home_status, home_body, _ = await _bl_conn.get(base_path or "/")
     home_hash = md5(home_body) if home_body else None
+    await _bl_conn.close()
 
     lbl = "catch-all detected" if baseline_status == 200 else "ok"
     print(f"\r  {C.GRAY}[*] Baseline: status={baseline_status}  size={baseline_size}B  {lbl}{C.RESET}          ")
@@ -950,9 +1226,7 @@ async def run_vhost(args):
 
     # Collect baseline (3 random vhosts)
     print(f"  {C.GRAY}[*] Collecting baseline responses (3 random vhosts)...{C.RESET}", end="", flush=True)
-    baseline = await loop.run_in_executor(
-        None, _collect_vhost_baseline, target_ip, port, use_ssl, args.domain, args.timeout, 3
-    )
+    baseline = await _collect_vhost_baseline_async(target_ip, port, use_ssl, args.domain, args.timeout, 3)
 
     if baseline.samples:
         sample = baseline.samples[0]
@@ -1066,7 +1340,7 @@ def main():
     dp = sub_parsers.add_parser("dir", help="Directory / path enumeration")
     dp.add_argument("url")
     dp.add_argument("-w", "--wordlist",  required=True)
-    dp.add_argument("-t", "--threads",   type=int, default=50)
+    dp.add_argument("-t", "--threads",   type=int, default=300)
     dp.add_argument("--timeout",         type=int, default=5)
     dp.add_argument("-x", "--ext",       metavar="EXTS",  help="Extensions  e.g. php,html,txt")
     dp.add_argument("--fc",              metavar="CODES",  help="Filter status codes")
